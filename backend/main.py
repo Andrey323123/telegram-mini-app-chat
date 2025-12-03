@@ -1,4 +1,4 @@
-# main.py - ГЛАВНЫЙ ФАЙЛ ДЛЯ TELEGRAM MINI APP CHAT
+# backend/main.py - ГЛАВНЫЙ ФАЙЛ ДЛЯ TELEGRAM MINI APP CHAT
 import os
 import sys
 from pathlib import Path
@@ -8,14 +8,12 @@ import logging
 import sqlite3
 import asyncio
 import urllib.parse
-from typing import Dict, Set, Optional, List, Any
 import hashlib
 import hmac
 import secrets
-import mimetypes
-import uuid
+import re
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Query, Header
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
@@ -29,16 +27,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ======================= КОНФИГУРАЦИЯ =======================
-IS_PRODUCTION = os.getenv("RAILWAY_ENVIRONMENT") == "production"
+IS_RAILWAY = os.getenv("RAILWAY_ENVIRONMENT") == "production"
 
-if IS_PRODUCTION:
+if IS_RAILWAY:
     BASE_DIR = Path("/")
     DATA_DIR = Path("/data")
-    logger.info("🚂 Production Mode (Railway)")
+    logger.info("🚂 Railway Production Mode")
 else:
-    BASE_DIR = Path(__file__).resolve().parent
+    # Файл находится в backend/, поэтому parent.parent
+    BASE_DIR = Path(__file__).resolve().parent.parent
     DATA_DIR = BASE_DIR / "data"
-    logger.info("💻 Development Mode (Local)")
+    logger.info("💻 Local Development Mode")
 
 MEDIA_DIR = DATA_DIR / "media"
 DB_PATH = DATA_DIR / "chat.db"
@@ -48,8 +47,8 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
 # Telegram Bot Token (для валидации WebApp)
-BOT_TOKEN = os.getenv("BOT_TOKEN", "DUMMY_TOKEN_FOR_DEV")
-TELEGRAM_BOT_USERNAME = os.getenv("BOT_USERNAME", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 
 # ======================= ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ =======================
 def init_db():
@@ -110,17 +109,17 @@ def init_db():
         cursor.execute("SELECT COUNT(*) FROM chat_rooms WHERE id = 1")
         if cursor.fetchone()[0] == 0:
             cursor.execute(
-                "INSERT INTO chat_rooms (id, name, description) VALUES (1, 'Общий чат', 'Добро пожаловать в чат!')"
+                "INSERT INTO chat_rooms (id, name, description) VALUES (1, 'Общий чат', 'Добро пожаловать!')"
             )
             logger.info("✅ Создан общий чат")
         
         # Создаем тестового пользователя для разработки
-        if not IS_PRODUCTION:
+        if not IS_RAILWAY:
             cursor.execute("SELECT COUNT(*) FROM users WHERE telegram_id = 123456789")
             if cursor.fetchone()[0] == 0:
                 cursor.execute('''
-                INSERT INTO users (telegram_id, username, first_name, last_name, is_admin)
-                VALUES (123456789, 'test_user', 'Тестовый', 'Пользователь', 1)
+                INSERT INTO users (telegram_id, username, first_name, is_admin)
+                VALUES (123456789, 'test_user', 'Тестовый', 1)
                 ''')
                 logger.info("✅ Создан тестовый пользователь")
         
@@ -133,7 +132,7 @@ def init_db():
         raise
 
 # ======================= ВАЛИДАЦИЯ TELEGRAM WEBAPP =======================
-def validate_telegram_webapp(init_data: str) -> Optional[dict]:
+def validate_telegram_webapp(init_data: str):
     """Валидация данных от Telegram WebApp"""
     if not init_data:
         logger.warning("Нет initData от Telegram")
@@ -171,8 +170,7 @@ def validate_telegram_webapp(init_data: str) -> Optional[dict]:
 # ======================= WEBSOCKET МЕНЕДЖЕР =======================
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: Dict[int, Dict[int, WebSocket]] = {}
-        self.user_typing: Dict[int, Dict[int, datetime]] = {}  # chat_id -> user_id -> timestamp
+        self.active_connections = {}  # chat_id -> {user_id: WebSocket}
         
     async def connect(self, websocket: WebSocket, chat_id: int, user_id: int):
         await websocket.accept()
@@ -187,7 +185,8 @@ class ConnectionManager:
         await self.broadcast_to_chat(chat_id, {
             "type": "user_connected",
             "user_id": user_id,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "online_count": len(self.active_connections[chat_id])
         }, exclude_user=user_id)
         
     def disconnect(self, chat_id: int, user_id: int):
@@ -199,14 +198,13 @@ class ConnectionManager:
             asyncio.create_task(self.broadcast_to_chat(chat_id, {
                 "type": "user_disconnected",
                 "user_id": user_id,
-                "timestamp": datetime.now(timezone.utc).isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "online_count": len(self.active_connections.get(chat_id, {}))
             }))
             
             # Очищаем если нет подключений
             if not self.active_connections[chat_id]:
                 del self.active_connections[chat_id]
-                if chat_id in self.user_typing:
-                    del self.user_typing[chat_id]
                     
     async def broadcast_to_chat(self, chat_id: int, message: dict, exclude_user: int = None):
         """Отправка сообщения всем в чате"""
@@ -230,29 +228,6 @@ class ConnectionManager:
                 await self.active_connections[chat_id][user_id].send_json(message)
             except Exception as e:
                 logger.error(f"Ошибка отправки пользователю: {e}")
-                
-    def set_typing(self, chat_id: int, user_id: int):
-        """Установка статуса 'печатает'"""
-        if chat_id not in self.user_typing:
-            self.user_typing[chat_id] = {}
-        self.user_typing[chat_id][user_id] = datetime.now(timezone.utc)
-        
-    def get_typing_users(self, chat_id: int) -> List[int]:
-        """Получение пользователей, которые печатают"""
-        if chat_id not in self.user_typing:
-            return []
-            
-        # Удаляем устаревшие записи (старше 5 секунд)
-        now = datetime.now(timezone.utc)
-        expired = []
-        for uid, timestamp in self.user_typing[chat_id].items():
-            if (now - timestamp).total_seconds() > 5:
-                expired.append(uid)
-                
-        for uid in expired:
-            del self.user_typing[chat_id][uid]
-            
-        return list(self.user_typing[chat_id].keys())
 
 # Инициализируем менеджер соединений
 manager = ConnectionManager()
@@ -293,27 +268,22 @@ app.add_middleware(
 
 # Статические файлы
 if (BASE_DIR / "client").exists():
-    app.mount("/static", StaticFiles(directory="client"), name="static")
+    app.mount("/static", StaticFiles(directory=BASE_DIR / "client"), name="static")
     logger.info("✅ Static files mounted at /static")
     
-app.mount("/media", StaticFiles(directory=MEDIA_DIR), name="media")
-logger.info("✅ Media files mounted at /media")
+if MEDIA_DIR.exists():
+    app.mount("/media", StaticFiles(directory=MEDIA_DIR), name="media")
+    logger.info("✅ Media files mounted at /media")
 
 # ======================= API ЭНДПОЙНТЫ =======================
 @app.get("/")
 async def root():
     """Главная страница"""
-    index_path = Path("client/index.html") if not IS_PRODUCTION else BASE_DIR / "client" / "index.html"
+    index_path = BASE_DIR / "client" / "index.html"
     
     if index_path.exists():
         with open(index_path, "r", encoding="utf-8") as f:
             html_content = f.read()
-            
-        # Заменяем переменные
-        html_content = html_content.replace(
-            "{{WS_URL}}", 
-            f"ws://{os.getenv('RAILWAY_STATIC_URL', 'localhost:8000')}" if IS_PRODUCTION else "ws://localhost:8000"
-        )
         
         return HTMLResponse(html_content)
     
@@ -324,13 +294,13 @@ async def root():
     <head>
         <title>Telegram Chat Mini App</title>
         <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <script src="https://telegram.org/js/telegram-web-app.js"></script>
         <style>
             body {
                 background: #1a1a1a;
                 color: white;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                font-family: -apple-system, BlinkMacSystemFont, sans-serif;
                 margin: 0;
                 padding: 20px;
                 text-align: center;
@@ -349,24 +319,10 @@ async def root():
                 border-radius: 12px;
                 padding: 20px;
                 margin: 20px 0;
-                text-align: left;
             }
             .success {
                 color: #4CAF50;
                 font-weight: bold;
-            }
-            .error {
-                color: #f44336;
-            }
-            button {
-                background: #4dabf7;
-                color: white;
-                border: none;
-                padding: 12px 24px;
-                border-radius: 24px;
-                font-size: 16px;
-                cursor: pointer;
-                margin: 10px;
             }
         </style>
     </head>
@@ -381,37 +337,11 @@ async def root():
                 <p><strong>WebSocket:</strong> Включен</p>
             </div>
             <p>Откройте это приложение через Telegram бота для использования чата.</p>
-            <div id="telegram-auth"></div>
+            <p><a href="/api/health">Health Check</a> | <a href="/api/chat/messages">Messages API</a></p>
         </div>
-        <script>
-            // Telegram WebApp инициализация
-            const tg = window.Telegram.WebApp;
-            
-            if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
-                document.getElementById('telegram-auth').innerHTML = `
-                    <div class="status">
-                        <p><strong>Telegram User:</strong> ${tg.initDataUnsafe.user.first_name}</p>
-                        <p><strong>Username:</strong> @${tg.initDataUnsafe.user.username || 'не указан'}</p>
-                        <button onclick="location.href='/chat'">Перейти в чат</button>
-                    </div>
-                `;
-            } else {
-                document.getElementById('telegram-auth').innerHTML = `
-                    <div class="status">
-                        <p class="error">❌ Не авторизован в Telegram</p>
-                        <p>Откройте это приложение через Telegram бота</p>
-                    </div>
-                `;
-            }
-        </script>
     </body>
     </html>
     """)
-
-@app.get("/chat")
-async def chat_page():
-    """Страница чата"""
-    return await root()
 
 @app.get("/api/health")
 async def health_check():
@@ -427,7 +357,7 @@ async def health_check():
         "database": db_status,
         "media_directory": media_status,
         "active_connections": sum(len(users) for users in manager.active_connections.values()),
-        "environment": "production" if IS_PRODUCTION else "development"
+        "environment": "production" if IS_RAILWAY else "development"
     }
 
 @app.post("/api/auth/telegram")
@@ -435,13 +365,13 @@ async def auth_telegram(request: Request):
     """Авторизация через Telegram WebApp"""
     try:
         data = await request.json()
-        init_data = data.get("init_data")
+        init_data = data.get("init_data", "")
         
         # Валидация данных Telegram
         user_info = validate_telegram_webapp(init_data)
         
         # Режим разработки если нет данных Telegram
-        if not user_info and not IS_PRODUCTION:
+        if not user_info and not IS_RAILWAY:
             user_info = {
                 "id": 123456789,
                 "username": "test_user",
@@ -479,14 +409,13 @@ async def auth_telegram(request: Request):
                 "first_name": user_row[2] or user_info.get("first_name", ""),
                 "avatar_url": user_row[3],
                 "is_admin": bool(user_row[4]),
-                "is_banned": bool(user_row[5]),
-                "is_muted": False
+                "is_banned": bool(user_row[5])
             }
         else:
             # Создаем нового пользователя
             cursor.execute('''
-            INSERT INTO users (telegram_id, username, first_name, last_name, avatar_url, is_bot, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO users (telegram_id, username, first_name, last_name, avatar_url, is_bot)
+            VALUES (?, ?, ?, ?, ?, ?)
             ''', (
                 user_info["id"],
                 user_info.get("username", ""),
@@ -504,8 +433,7 @@ async def auth_telegram(request: Request):
                 "first_name": user_info.get("first_name", ""),
                 "avatar_url": user_info.get("photo_url"),
                 "is_admin": False,
-                "is_banned": False,
-                "is_muted": False
+                "is_banned": False
             }
         
         conn.close()
@@ -515,7 +443,7 @@ async def auth_telegram(request: Request):
         return JSONResponse({
             "success": True,
             "user": user_data,
-            "token": secrets.token_hex(16),  # Простой токен для сессии
+            "token": secrets.token_hex(16),
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
         
@@ -526,8 +454,7 @@ async def auth_telegram(request: Request):
 @app.get("/api/chat/messages")
 async def get_messages(
     chat_id: int = Query(1, description="ID чата"),
-    limit: int = Query(50, description="Количество сообщений"),
-    offset: int = Query(0, description="Смещение")
+    limit: int = Query(50, description="Количество сообщений")
 ):
     """Получение сообщений чата"""
     try:
@@ -544,8 +471,8 @@ async def get_messages(
         JOIN users u ON m.user_id = u.id
         WHERE m.chat_room_id = ? AND m.is_deleted = 0
         ORDER BY m.created_at DESC
-        LIMIT ? OFFSET ?
-        ''', (chat_id, limit, offset))
+        LIMIT ?
+        ''', (chat_id, limit))
         
         rows = cursor.fetchall()
         conn.close()
@@ -575,9 +502,7 @@ async def get_messages(
                 "media_url": f"/media/{row['media_filename']}" if row["media_filename"] else None,
                 "media_size": row["media_size"],
                 "mentions": mentions,
-                "created_at": row["created_at"],
-                "is_edited": False,
-                "is_deleted": False
+                "created_at": row["created_at"]
             })
         
         # Реверсируем чтобы старые сообщения были первыми
@@ -587,8 +512,7 @@ async def get_messages(
             "success": True,
             "messages": messages,
             "count": len(messages),
-            "chat_id": chat_id,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "chat_id": chat_id
         }
         
     except Exception as e:
@@ -598,9 +522,8 @@ async def get_messages(
 @app.post("/api/chat/send")
 async def send_message(
     user_id: int = Form(...),
-    content: str = Form("", description="Текст сообщения"),
-    chat_id: int = Form(1, description="ID чата"),
-    file: UploadFile = File(None, description="Файл для отправки")
+    content: str = Form(""),
+    file: UploadFile = File(None)
 ):
     """Отправка сообщения"""
     try:
@@ -609,7 +532,7 @@ async def send_message(
         cursor = conn.cursor()
         
         cursor.execute(
-            "SELECT id, is_banned, muted_until FROM users WHERE id = ?",
+            "SELECT id, is_banned FROM users WHERE id = ?",
             (user_id,)
         )
         user = cursor.fetchone()
@@ -623,25 +546,18 @@ async def send_message(
             conn.close()
             raise HTTPException(status_code=403, detail="User is banned")
         
-        # Проверяем мьют
-        if user[2]:  # muted_until
-            muted_until = datetime.fromisoformat(user[2])
-            if muted_until > datetime.now(timezone.utc):
-                conn.close()
-                raise HTTPException(status_code=403, detail="User is muted")
-        
         # Обработка файла если есть
         message_type = "text"
         media_filename = None
         media_size = 0
         
         if file and file.filename:
-            # Проверяем размер файла (макс 10MB)
-            MAX_SIZE = 10 * 1024 * 1024
+            # Проверяем размер файла (макс 5MB)
+            MAX_SIZE = 5 * 1024 * 1024
             
             # Генерируем уникальное имя файла
             file_extension = os.path.splitext(file.filename)[1] or ".bin"
-            unique_filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{user_id}_{secrets.token_hex(8)}{file_extension}"
+            unique_filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{user_id}{file_extension}"
             file_path = MEDIA_DIR / unique_filename
             
             # Сохраняем файл
@@ -649,7 +565,7 @@ async def send_message(
             
             if len(content_bytes) > MAX_SIZE:
                 conn.close()
-                raise HTTPException(status_code=413, detail="File too large (max 10MB)")
+                raise HTTPException(status_code=413, detail="File too large (max 5MB)")
             
             with open(file_path, "wb") as f:
                 f.write(content_bytes)
@@ -670,39 +586,16 @@ async def send_message(
             else:
                 message_type = "file"
         
-        # Извлекаем упоминания из текста
-        mentions = []
-        if content:
-            # Простой парсинг упоминаний @username
-            import re
-            mention_pattern = r'@(\w+)'
-            mentioned_usernames = re.findall(mention_pattern, content)
-            
-            if mentioned_usernames:
-                # Получаем ID пользователей по username
-                placeholders = ','.join(['?'] * len(mentioned_usernames))
-                cursor.execute(
-                    f"SELECT id, username FROM users WHERE username IN ({placeholders})",
-                    mentioned_usernames
-                )
-                for user_row in cursor.fetchall():
-                    mentions.append({
-                        "user_id": user_row[0],
-                        "username": user_row[1]
-                    })
-        
         # Сохраняем сообщение в БД
         cursor.execute('''
-        INSERT INTO messages (chat_room_id, user_id, message_type, content, media_filename, media_size, mentions, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        INSERT INTO messages (chat_room_id, user_id, message_type, content, media_filename, media_size, created_at)
+        VALUES (1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ''', (
-            chat_id,
             user_id,
             message_type,
             content.strip() if content else None,
             media_filename,
-            media_size,
-            json.dumps(mentions) if mentions else None
+            media_size
         ))
         
         message_id = cursor.lastrowid
@@ -720,7 +613,7 @@ async def send_message(
         # Формируем объект сообщения
         message = {
             "id": message_id,
-            "chat_id": chat_id,
+            "chat_id": 1,
             "user": {
                 "id": user_id,
                 "username": user_data[0],
@@ -731,25 +624,20 @@ async def send_message(
             "content": content,
             "media_url": f"/media/{media_filename}" if media_filename else None,
             "media_size": media_size,
-            "mentions": mentions,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "is_edited": False,
-            "is_deleted": False
+            "created_at": datetime.now(timezone.utc).isoformat()
         }
         
         # Отправляем через WebSocket
-        await manager.broadcast_to_chat(chat_id, {
+        await manager.broadcast_to_chat(1, {
             "type": "new_message",
-            "message": message,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "message": message
         })
         
         logger.info(f"📨 Message sent: {message_id} by user {user_id}")
         
         return JSONResponse({
             "success": True,
-            "message": message,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "message": message
         })
         
     except HTTPException:
@@ -758,56 +646,6 @@ async def send_message(
         logger.error(f"❌ Error sending message: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to send message: {str(e)}")
 
-@app.get("/api/chat/users")
-async def get_chat_users(chat_id: int = Query(1, description="ID чата")):
-    """Получение пользователей чата"""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        # Получаем пользователей, которые отправляли сообщения в чат
-        cursor.execute('''
-        SELECT DISTINCT 
-            u.id, u.telegram_id, u.username, u.first_name, u.avatar_url,
-            u.is_admin, u.is_banned, MAX(m.created_at) as last_activity
-        FROM users u
-        JOIN messages m ON u.id = m.user_id
-        WHERE m.chat_room_id = ?
-        GROUP BY u.id
-        ORDER BY last_activity DESC
-        LIMIT 100
-        ''', (chat_id,))
-        
-        users = []
-        for row in cursor.fetchall():
-            users.append({
-                "id": row["id"],
-                "telegram_id": row["telegram_id"],
-                "username": row["username"],
-                "first_name": row["first_name"],
-                "avatar_url": row["avatar_url"],
-                "is_admin": bool(row["is_admin"]),
-                "is_banned": bool(row["is_banned"]),
-                "last_activity": row["last_activity"],
-                "is_online": row["id"] in (manager.active_connections.get(chat_id, {}).keys())
-            })
-        
-        conn.close()
-        
-        return {
-            "success": True,
-            "users": users,
-            "count": len(users),
-            "chat_id": chat_id,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Error getting users: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get users: {str(e)}")
-
-# ======================= WEBSOCKET ЭНДПОЙНТ =======================
 @app.websocket("/ws/{chat_id}/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, chat_id: int, user_id: int):
     """WebSocket endpoint для реального времени"""
@@ -821,9 +659,6 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int, user_id: int):
             
             if event_type == "typing":
                 # Пользователь печатает
-                manager.set_typing(chat_id, user_id)
-                
-                # Отправляем уведомление всем в чате
                 await manager.broadcast_to_chat(chat_id, {
                     "type": "user_typing",
                     "user_id": user_id,
@@ -837,107 +672,11 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int, user_id: int):
                     "timestamp": datetime.now(timezone.utc).isoformat()
                 })
                 
-            elif event_type == "get_typing":
-                # Получение списка печатающих пользователей
-                typing_users = manager.get_typing_users(chat_id)
-                await websocket.send_json({
-                    "type": "typing_users",
-                    "users": typing_users,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                })
-                
-            elif event_type == "read_receipt":
-                # Подтверждение прочтения
-                message_id = data.get("message_id")
-                await manager.broadcast_to_chat(chat_id, {
-                    "type": "message_read",
-                    "user_id": user_id,
-                    "message_id": message_id,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                }, exclude_user=user_id)
-                
     except WebSocketDisconnect:
         manager.disconnect(chat_id, user_id)
     except Exception as e:
         logger.error(f"❌ WebSocket error: {e}")
         manager.disconnect(chat_id, user_id)
-
-# ======================= АДМИН ЭНДПОЙНТЫ =======================
-@app.post("/api/admin/mute")
-async def mute_user(
-    user_id: int = Form(...),
-    admin_id: int = Form(...),
-    duration_minutes: int = Form(60),
-    reason: str = Form("")
-):
-    """Мьют пользователя (только для админов)"""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        # Проверяем что админ
-        cursor.execute(
-            "SELECT is_admin FROM users WHERE id = ?",
-            (admin_id,)
-        )
-        admin = cursor.fetchone()
-        
-        if not admin or not admin[0]:
-            conn.close()
-            raise HTTPException(status_code=403, detail="Not an admin")
-        
-        # Устанавливаем мьют
-        muted_until = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
-        cursor.execute(
-            "UPDATE users SET muted_until = ? WHERE id = ?",
-            (muted_until.isoformat(), user_id)
-        )
-        
-        # Получаем данные пользователя для уведомления
-        cursor.execute(
-            "SELECT username, first_name FROM users WHERE id = ?",
-            (user_id,)
-        )
-        target_user = cursor.fetchone()
-        
-        conn.commit()
-        conn.close()
-        
-        # Отправляем уведомление через WebSocket
-        await manager.send_to_user(1, user_id, {
-            "type": "muted",
-            "duration_minutes": duration_minutes,
-            "reason": reason,
-            "muted_until": muted_until.isoformat(),
-            "admin_id": admin_id,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        })
-        
-        # Уведомляем чат
-        await manager.broadcast_to_chat(1, {
-            "type": "user_muted",
-            "user_id": user_id,
-            "user_name": target_user[1] if target_user else "Unknown",
-            "duration_minutes": duration_minutes,
-            "reason": reason,
-            "admin_id": admin_id,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        })
-        
-        logger.info(f"🔇 User {user_id} muted by admin {admin_id}")
-        
-        return {
-            "success": True,
-            "message": f"User muted for {duration_minutes} minutes",
-            "muted_until": muted_until.isoformat(),
-            "reason": reason
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Error muting user: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to mute user: {str(e)}")
 
 # ======================= ЗАПУСК СЕРВЕРА =======================
 if __name__ == "__main__":
@@ -947,13 +686,13 @@ if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
     
     logger.info(f"🚀 Starting server on {host}:{port}")
-    logger.info(f"🌐 WebSocket available at ws://{host}:{port}/ws/{{chat_id}}/{{user_id}}")
-    logger.info(f"📊 Health check: http://{host}:{port}/api/health")
+    logger.info(f"🌐 WebSocket: ws://{host}:{port}/ws/{{chat_id}}/{{user_id}}")
+    logger.info(f"📊 Health: http://{host}:{port}/api/health")
     
+    # Запускаем приложение
     uvicorn.run(
-        "main:app",
+        app,
         host=host,
         port=port,
-        reload=not IS_PRODUCTION,
         log_level="info"
     )
