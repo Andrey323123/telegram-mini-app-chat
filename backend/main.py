@@ -1,161 +1,156 @@
+# backend/main.py - РАБОЧАЯ ВЕРСИЯ ДЛЯ RAILWAY
 import os
 import sys
 from pathlib import Path
+from datetime import datetime, timezone
+import json
+import logging
 
-# ======================= ВСЕ ИМПОРТЫ В НАЧАЛЕ =======================
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, WebSocket, WebSocketDisconnect
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(name)s | %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Добавляем пути
+sys.path.append(str(Path(__file__).parent))
+
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, ForeignKey, func
-from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
-from contextlib import asynccontextmanager
-import json
-from datetime import datetime, timedelta
-import shutil
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi import WebSocket, WebSocketDisconnect
+import sqlite3
+from typing import Dict, Set
 import asyncio
-from typing import Dict, Set, List
-import uvicorn
+import urllib.parse
 
 # ======================= КОНФИГУРАЦИЯ =======================
-# Определяем где мы - Railway или локально
 IS_RAILWAY = os.getenv("RAILWAY_ENVIRONMENT") == "production"
 
 if IS_RAILWAY:
-    # В Railway используем /data volume
     BASE_DIR = Path("/")
     DATA_DIR = Path("/data")
-    print("🚂 Railway Production Mode")
+    logger.info("🚂 Railway Production Mode")
 else:
-    # Локально
     BASE_DIR = Path(__file__).resolve().parent.parent
     DATA_DIR = BASE_DIR / "data"
-    print("💻 Local Development Mode")
+    logger.info("💻 Local Development Mode")
 
-# Создаем папки если их нет
+# Создаем папки
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 MEDIA_PATH = DATA_DIR / "media"
 MEDIA_PATH.mkdir(parents=True, exist_ok=True)
-SQLITE_PATH = DATA_DIR / "chat.db"
+DB_PATH = DATA_DIR / "chat.db"
 
 class Config:
-    BOT_TOKEN = os.getenv("BOT_TOKEN", "test_token")
-    BOT_USERNAME = os.getenv("BOT_USERNAME", "test_bot")
-    PORT = int(os.getenv("PORT", 8080))  # Railway использует 8080!
+    PORT = int(os.getenv("PORT", 8080))
     HOST = os.getenv("HOST", "0.0.0.0")
-    DATABASE_URL = f"sqlite:///{SQLITE_PATH}"
-    MEDIA_PATH = MEDIA_PATH
-    MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
-    ENVIRONMENT = "production" if IS_RAILWAY else "development"
+    BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+    BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 
 # ======================= БАЗА ДАННЫХ =======================
-engine = create_engine(
-    Config.DATABASE_URL,
-    connect_args={"check_same_thread": False},
-    echo=False
-)
+def init_db():
+    """Инициализация SQLite базы"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Пользователи
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER UNIQUE NOT NULL,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        avatar_url TEXT,
+        is_bot BOOLEAN DEFAULT 0,
+        is_admin BOOLEAN DEFAULT 0,
+        is_banned BOOLEAN DEFAULT 0,
+        muted_until TIMESTAMP,
+        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    # Чаты
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS chat_rooms (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        description TEXT,
+        is_public BOOLEAN DEFAULT 1,
+        max_members INTEGER DEFAULT 1000,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    # Сообщения
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_room_id INTEGER DEFAULT 1,
+        user_id INTEGER NOT NULL,
+        message_type TEXT DEFAULT 'text',
+        content TEXT,
+        media_filename TEXT,
+        media_size INTEGER,
+        mentions TEXT,
+        is_edited BOOLEAN DEFAULT 0,
+        is_deleted BOOLEAN DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id)
+    )
+    ''')
+    
+    # Создаем общий чат если его нет
+    cursor.execute("SELECT COUNT(*) FROM chat_rooms WHERE id = 1")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute(
+            "INSERT INTO chat_rooms (id, name, description) VALUES (1, 'Общий чат', 'Добро пожаловать!')"
+        )
+    
+    conn.commit()
+    conn.close()
+    logger.info("✅ База данных инициализирована")
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+# Инициализируем БД при старте
+init_db()
 
-def get_db():
-    db = SessionLocal()
+# ======================= ВАЛИДАЦИЯ Telegram WebApp =======================
+def validate_init_data(init_data: str) -> dict | None:
+    """Валидация данных от Telegram WebApp"""
+    if not init_data:
+        return None
+    
     try:
-        yield db
-    finally:
-        db.close()
+        params = dict([x.split('=', 1) for x in init_data.split('&')])
+        user_str = params.get('user', '')
+        
+        if not user_str:
+            return None
 
-# ======================= МОДЕЛИ БАЗЫ ДАННЫХ =======================
-class User(Base):
-    __tablename__ = "users"
-    
-    id = Column(Integer, primary_key=True)
-    telegram_id = Column(Integer, unique=True, nullable=False)
-    username = Column(String(100))
-    first_name = Column(String(100))
-    last_name = Column(String(100))
-    avatar_url = Column(String(500))
-    is_bot = Column(Boolean, default=False)
-    is_admin = Column(Boolean, default=False)
-    is_banned = Column(Boolean, default=False)
-    muted_until = Column(DateTime, nullable=True)
-    last_seen = Column(DateTime, default=datetime.utcnow)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    
-    messages = relationship("Message", back_populates="user")
+        user_str = urllib.parse.unquote(user_str)
+        user_data = json.loads(user_str)
+        user_id = int(user_data["id"])
+        
+        return {
+            "user_id": user_id,
+            "username": user_data.get("username"),
+            "first_name": user_data.get("first_name"),
+            "last_name": user_data.get("last_name"),
+            "photo_url": user_data.get("photo_url"),
+            "is_bot": user_data.get("is_bot", False)
+        }
+    except Exception as e:
+        logger.error(f"Ошибка валидации initData: {e}")
+        return None
 
-class ChatRoom(Base):
-    __tablename__ = "chat_rooms"
-    
-    id = Column(Integer, primary_key=True)
-    name = Column(String(100), nullable=False)
-    description = Column(Text)
-    is_public = Column(Boolean, default=True)
-    max_members = Column(Integer, default=1000)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    
-    messages = relationship("Message", back_populates="chat_room")
+# ======================= FASTAPI =======================
+app = FastAPI()
 
-class Message(Base):
-    __tablename__ = "messages"
-    
-    id = Column(Integer, primary_key=True)
-    chat_room_id = Column(Integer, ForeignKey("chat_rooms.id"), nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    message_type = Column(String(20), default="text")  # text, photo, voice, file
-    content = Column(Text)
-    media_filename = Column(String(500))
-    media_size = Column(Integer)
-    mentions = Column(Text)  # JSON
-    is_edited = Column(Boolean, default=False)
-    is_deleted = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, onupdate=datetime.utcnow)
-    
-    user = relationship("User", back_populates="messages")
-    chat_room = relationship("ChatRoom", back_populates="messages")
-
-# ======================= LIFESPAN МЕНЕДЖЕР =======================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    Base.metadata.create_all(bind=engine)
-    
-    db = SessionLocal()
-    try:
-        if db.query(ChatRoom).count() == 0:
-            general_chat = ChatRoom(
-                id=1,
-                name="Общий чат",
-                description="Добро пожаловать в групповой чат!",
-                is_public=True,
-                max_members=10000
-            )
-            db.add(general_chat)
-            db.commit()
-            print("✅ База данных и общий чат созданы")
-    finally:
-        db.close()
-    
-    print(f"🚀 Сервер запущен на порту {Config.PORT}")
-    print(f"🌐 Домен: telegram-mini-app-chat-production.up.railway.app")
-    print(f"📁 База данных: {SQLITE_PATH}")
-    
-    yield  # App runs here
-    
-    # Shutdown
-    print("👋 Сервер остановлен")
-
-# ======================= FASTAPI ПРИЛОЖЕНИЕ =======================
-app = FastAPI(
-    title="Telegram Chat Mini App",
-    version="1.0",
-    docs_url=None,
-    redoc_url=None,
-    lifespan=lifespan
-)
-
-# CORS - разрешаем все запросы
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -166,7 +161,7 @@ app.add_middleware(
 
 # Статические файлы
 app.mount("/static", StaticFiles(directory="client"), name="static")
-app.mount("/media", StaticFiles(directory=Config.MEDIA_PATH), name="media")
+app.mount("/media", StaticFiles(directory=MEDIA_PATH), name="media")
 
 # ======================= WEBSOCKET МЕНЕДЖЕР =======================
 class ConnectionManager:
@@ -186,21 +181,8 @@ class ConnectionManager:
             self.user_chats[user_id] = set()
         self.user_chats[user_id].add(chat_id)
         
-        # Уведомляем чат
-        await self.broadcast_to_chat(chat_id, {
-            "type": "user_joined",
-            "user_id": user_id,
-            "timestamp": datetime.utcnow().isoformat(),
-            "online_count": len(self.active_connections[chat_id])
-        }, exclude_user=user_id)
+        logger.info(f"👤 Пользователь {user_id} присоединился к чату {chat_id}")
         
-        # Отправляем текущий онлайн пользователю
-        await websocket.send_json({
-            "type": "online_users",
-            "users": list(self.active_connections[chat_id].keys()),
-            "count": len(self.active_connections[chat_id])
-        })
-    
     def disconnect(self, chat_id: int, user_id: int):
         if chat_id in self.active_connections and user_id in self.active_connections[chat_id]:
             del self.active_connections[chat_id][user_id]
@@ -213,43 +195,19 @@ class ConnectionManager:
                 if not self.user_chats[user_id]:
                     del self.user_chats[user_id]
             
-            # Уведомляем чат
-            asyncio.create_task(self.broadcast_to_chat(chat_id, {
-                "type": "user_left",
-                "user_id": user_id,
-                "timestamp": datetime.utcnow().isoformat(),
-                "online_count": len(self.active_connections.get(chat_id, {}))
-            }))
-    
-    async def broadcast_to_chat(self, chat_id: int, message: dict, exclude_user: int = None):
-        if chat_id in self.active_connections:
-            for user_id, connection in self.active_connections[chat_id].items():
-                if user_id != exclude_user:
-                    try:
-                        await connection.send_json(message)
-                    except:
-                        pass
-    
-    async def send_to_user(self, user_id: int, message: dict):
-        for chat_id in self.user_chats.get(user_id, []):
-            if chat_id in self.active_connections and user_id in self.active_connections[chat_id]:
-                try:
-                    await self.active_connections[chat_id][user_id].send_json(message)
-                except:
-                    pass
+            logger.info(f"👤 Пользователь {user_id} вышел из чата {chat_id}")
 
 manager = ConnectionManager()
 
 # ======================= API ENDPOINTS =======================
 @app.get("/")
 async def serve_index():
-    """Главная страница - отдаем index.html"""
+    """Главная страница"""
     index_path = Path("client/index.html")
     if index_path.exists():
         with open(index_path, "r", encoding="utf-8") as f:
             return f.read()
     
-    # Если файла нет - простая страница
     return HTMLResponse("""
     <!DOCTYPE html>
     <html>
@@ -258,11 +216,13 @@ async def serve_index():
         <style>
             body { background: #1a1a1a; color: white; text-align: center; padding: 50px; }
             h1 { color: #4dabf7; }
+            .success { color: #4CAF50; font-weight: bold; }
         </style>
     </head>
     <body>
-        <h1>Telegram Chat Mini App</h1>
-        <p>✅ Сервер работает на Railway!</p>
+        <h1>💬 Telegram Chat Mini App</h1>
+        <p class="success">✅ Сервер работает!</p>
+        <p>Домен: telegram-mini-app-chat-production.up.railway.app</p>
         <p>Откройте в Telegram через бота</p>
     </body>
     </html>
@@ -273,204 +233,206 @@ async def health_check():
     """Health check для Railway"""
     return JSONResponse({
         "status": "healthy",
-        "service": "telegram-chat-mini-app",
-        "environment": Config.ENVIRONMENT,
+        "service": "telegram-chat",
         "railway": IS_RAILWAY,
         "domain": "telegram-mini-app-chat-production.up.railway.app",
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     })
 
 @app.post("/api/auth/telegram")
-async def auth_telegram(data: dict, db: Session = Depends(get_db)):
-    """Авторизация через Telegram Web App"""
-    try:
-        user_data = data.get("user", {})
-        telegram_id = user_data.get("id")
+async def auth_telegram(request: Request):
+    """Авторизация через Telegram WebApp"""
+    init_data = request.headers.get("X-Telegram-WebApp-Init-Data")
+    user_info = validate_init_data(init_data)
+    
+    if not user_info:
+        # Для разработки - тестовый пользователь
+        user_info = {
+            "user_id": 123456789,
+            "username": "test_user",
+            "first_name": "Тестовый",
+            "last_name": "Пользователь",
+            "photo_url": None,
+            "is_bot": False
+        }
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Ищем пользователя
+    cursor.execute("SELECT * FROM users WHERE telegram_id = ?", (user_info["user_id"],))
+    user = cursor.fetchone()
+    
+    if user:
+        # Обновляем last_seen
+        cursor.execute(
+            "UPDATE users SET last_seen = CURRENT_TIMESTAMP WHERE id = ?",
+            (user[0],)
+        )
+        conn.commit()
         
-        if not telegram_id:
-            raise HTTPException(status_code=400, detail="No user data provided")
+        user_data = {
+            "id": user[0],
+            "telegram_id": user[1],
+            "username": user[2],
+            "first_name": user[3],
+            "avatar_url": user[5],
+            "is_admin": bool(user[7]),
+            "is_banned": bool(user[8])
+        }
+    else:
+        # Создаем нового пользователя
+        cursor.execute('''
+        INSERT INTO users (telegram_id, username, first_name, last_name, avatar_url, is_bot)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            user_info["user_id"],
+            user_info["username"],
+            user_info["first_name"],
+            user_info["last_name"],
+            user_info["photo_url"],
+            user_info["is_bot"]
+        ))
+        conn.commit()
         
-        # Ищем или создаем пользователя
-        user = db.query(User).filter(User.telegram_id == telegram_id).first()
-        
-        if not user:
-            user = User(
-                telegram_id=telegram_id,
-                username=user_data.get("username"),
-                first_name=user_data.get("first_name"),
-                last_name=user_data.get("last_name"),
-                avatar_url=user_data.get("photo_url"),
-                is_bot=user_data.get("is_bot", False)
-            )
-            db.add(user)
-            db.commit()
-            db.refresh(user)
-        else:
-            # Обновляем данные
-            user.username = user_data.get("username") or user.username
-            user.first_name = user_data.get("first_name") or user.first_name
-            user.last_name = user_data.get("last_name") or user.last_name
-            user.avatar_url = user_data.get("photo_url") or user.avatar_url
-            user.last_seen = datetime.utcnow()
-            db.commit()
-        
-        return JSONResponse({
-            "success": True,
-            "user": {
-                "id": user.id,
-                "telegram_id": user.telegram_id,
-                "username": user.username,
-                "first_name": user.first_name,
-                "last_name": user.last_name,
-                "avatar_url": user.avatar_url,
-                "is_admin": user.is_admin,
-                "is_banned": user.is_banned
-            }
-        })
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Authentication error: {str(e)}")
+        user_data = {
+            "id": cursor.lastrowid,
+            "telegram_id": user_info["user_id"],
+            "username": user_info["username"],
+            "first_name": user_info["first_name"],
+            "avatar_url": user_info["photo_url"],
+            "is_admin": False,
+            "is_banned": False
+        }
+    
+    conn.close()
+    
+    return JSONResponse({
+        "success": True,
+        "user": user_data
+    })
 
 @app.get("/api/chat/messages")
-async def get_messages(
-    chat_id: int = 1,
-    limit: int = 50,
-    db: Session = Depends(get_db)
-):
+async def get_messages(chat_id: int = 1, limit: int = 50):
     """Получить сообщения чата"""
-    try:
-        messages = db.query(Message).join(User).filter(
-            Message.chat_room_id == chat_id,
-            Message.is_deleted == False
-        ).order_by(Message.created_at.desc()).limit(limit).all()
-        
-        return {
-            "success": True,
-            "messages": [
-                {
-                    "id": msg.id,
-                    "user": {
-                        "id": msg.user.id,
-                        "telegram_id": msg.user.telegram_id,
-                        "username": msg.user.username,
-                        "first_name": msg.user.first_name,
-                        "last_name": msg.user.last_name,
-                        "avatar_url": msg.user.avatar_url,
-                        "is_admin": msg.user.is_admin
-                    },
-                    "content": msg.content,
-                    "type": msg.message_type,
-                    "media_url": f"/media/{msg.media_filename}" if msg.media_filename else None,
-                    "media_size": msg.media_size,
-                    "mentions": json.loads(msg.mentions) if msg.mentions else [],
-                    "is_edited": msg.is_edited,
-                    "created_at": msg.created_at.isoformat(),
-                    "updated_at": msg.updated_at.isoformat() if msg.updated_at else None
-                }
-                for msg in reversed(messages)  # Возвращаем в правильном порядке
-            ]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to load messages: {str(e)}")
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT m.*, u.username, u.first_name, u.avatar_url, u.is_admin
+    FROM messages m
+    JOIN users u ON m.user_id = u.id
+    WHERE m.chat_room_id = ? AND m.is_deleted = 0
+    ORDER BY m.created_at DESC
+    LIMIT ?
+    ''', (chat_id, limit))
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    messages = []
+    for row in reversed(rows):  # В правильном порядке
+        messages.append({
+            "id": row[0],
+            "user": {
+                "id": row[2],
+                "username": row[12],
+                "first_name": row[13],
+                "avatar_url": row[14],
+                "is_admin": bool(row[15])
+            },
+            "content": row[4],
+            "type": row[3],
+            "media_url": f"/media/{row[5]}" if row[5] else None,
+            "created_at": row[10]
+        })
+    
+    return {
+        "success": True,
+        "messages": messages
+    }
 
 @app.post("/api/chat/send")
-async def send_message(
-    user_id: int = Form(...),
-    content: str = Form(""),
-    file: UploadFile = File(None),
-    db: Session = Depends(get_db)
-):
+async def send_message(request: Request):
     """Отправить сообщение в чат"""
     try:
-        user = db.query(User).filter(User.id == user_id).first()
+        data = await request.json()
+        user_id = data.get("user_id")
+        content = data.get("content", "").strip()
+        
+        if not user_id or not content:
+            raise HTTPException(400, "Missing user_id or content")
+        
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Проверяем пользователя
+        cursor.execute("SELECT is_banned FROM users WHERE id = ?", (user_id,))
+        user = cursor.fetchone()
+        
         if not user:
-            raise HTTPException(status_code=404, detail="User not found")
+            conn.close()
+            raise HTTPException(404, "User not found")
         
-        message_type = "text"
-        media_filename = None
-        media_size = 0
-        
-        if file and file.filename:
-            # Проверяем размер
-            file_content = await file.read()
-            media_size = len(file_content)
-            
-            if media_size > Config.MAX_FILE_SIZE:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"File too large. Max size: {Config.MAX_FILE_SIZE // (1024*1024)}MB"
-                )
-            
-            # Сохраняем файл
-            ext = os.path.splitext(file.filename)[1] or ".bin"
-            media_filename = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{user_id}{ext}"
-            file_path = Path(Config.MEDIA_PATH) / media_filename
-            
-            with open(file_path, "wb") as f:
-                f.write(file_content)
-            
-            if file.content_type.startswith("image/"):
-                message_type = "photo"
-            elif file.content_type.startswith("audio/"):
-                message_type = "voice"
-            else:
-                message_type = "file"
+        if user[0]:  # is_banned
+            conn.close()
+            raise HTTPException(403, "User is banned")
         
         # Сохраняем сообщение
-        message = Message(
-            chat_room_id=1,
-            user_id=user_id,
-            message_type=message_type,
-            content=content,
-            media_filename=media_filename,
-            media_size=media_size,
-            created_at=datetime.utcnow()
-        )
+        cursor.execute('''
+        INSERT INTO messages (chat_room_id, user_id, content)
+        VALUES (1, ?, ?)
+        ''', (user_id, content))
         
-        db.add(message)
-        db.commit()
-        db.refresh(message)
+        conn.commit()
+        message_id = cursor.lastrowid
+        
+        # Получаем данные пользователя
+        cursor.execute("SELECT username, first_name, avatar_url FROM users WHERE id = ?", (user_id,))
+        user_data = cursor.fetchone()
+        
+        conn.close()
+        
+        message = {
+            "id": message_id,
+            "user": {
+                "id": user_id,
+                "username": user_data[0],
+                "first_name": user_data[1],
+                "avatar_url": user_data[2]
+            },
+            "content": content,
+            "type": "text",
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        # Отправляем через WebSocket
+        await manager.broadcast_to_chat(1, {
+            "type": "new_message",
+            "message": message
+        })
         
         return JSONResponse({
             "success": True,
-            "message": {
-                "id": message.id,
-                "user": {
-                    "id": user.id,
-                    "first_name": user.first_name,
-                    "avatar_url": user.avatar_url
-                },
-                "content": content,
-                "type": message_type,
-                "media_url": f"/media/{media_filename}" if media_filename else None,
-                "created_at": message.created_at.isoformat()
-            }
+            "message": message
         })
         
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to send message: {str(e)}")
+        logger.error(f"Ошибка отправки сообщения: {e}")
+        raise HTTPException(500, f"Failed to send message: {str(e)}")
 
 @app.websocket("/ws/{chat_id}/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, chat_id: int, user_id: int):
     """WebSocket endpoint для реального времени"""
+    await manager.connect(websocket, chat_id, user_id)
+    
     try:
-        await manager.connect(websocket, chat_id, user_id)
-        
-        # Обновляем last_seen
-        db = SessionLocal()
-        user = db.query(User).filter(User.id == user_id).first()
-        if user:
-            user.last_seen = datetime.utcnow()
-            db.commit()
-        db.close()
-        
         while True:
             data = await websocket.receive_json()
             message_type = data.get("type")
             
             if message_type == "typing":
+                # Пересылаем статус "печатает"
                 await manager.broadcast_to_chat(chat_id, {
                     "type": "user_typing",
                     "user_id": user_id
@@ -478,21 +440,35 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int, user_id: int):
                 
     except WebSocketDisconnect:
         manager.disconnect(chat_id, user_id)
-    except Exception as e:
-        print(f"WebSocket error: {e}")
-        manager.disconnect(chat_id, user_id)
 
-# ======================= ЗАПУСК СЕРВЕРА =======================
+# ======================= ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ =======================
+async def manager_broadcast_to_chat(chat_id: int, message: dict, exclude_user: int = None):
+    """Метод для рассылки сообщений в чат"""
+    if chat_id in manager.active_connections:
+        for uid, connection in manager.active_connections[chat_id].items():
+            if uid != exclude_user:
+                try:
+                    await connection.send_json(message)
+                except:
+                    pass
+
+# Привязываем метод к менеджеру
+manager.broadcast_to_chat = manager_broadcast_to_chat
+
+# ======================= ЗАПУСК =======================
 if __name__ == "__main__":
-    print(f"🔧 Конфигурация:")
-    print(f"   Порт: {Config.PORT}")
-    print(f"   Хост: {Config.HOST}")
-    print(f"   Режим: {Config.ENVIRONMENT}")
-    print(f"   БД: {Config.DATABASE_URL}")
+    import uvicorn
+    
+    port = Config.PORT
+    host = Config.HOST
+    
+    logger.info(f"🚀 Запуск сервера на {host}:{port}")
+    logger.info(f"🌐 Домен: telegram-mini-app-chat-production.up.railway.app")
+    logger.info(f"📁 База данных: {DB_PATH}")
     
     uvicorn.run(
-        app,
-        host=Config.HOST,
-        port=Config.PORT,
+        "main:app",
+        host=host,
+        port=port,
         log_level="info"
     )
