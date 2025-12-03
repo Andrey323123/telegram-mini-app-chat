@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Telegram Chat</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Загрузка показывается сначала -->
+        <div id="loading" class="loading">
+            <div style="text-align: center; padding: 40px;">
+                <div style="font-size: 24px; margin-bottom: 20px;">💬</div>
+                <div>Загрузка чата...</div>
+            </div>
+        </div>
+        
+        <!-- Основной интерфейс (скрыт сначала) -->
+        <div id="chat-interface" style="display: none; height: 100%;">
+            <!-- Шапка -->
+            <header class="header">
+                <div class="header-left">
+                    <div class="header-title">💬 Групповой чат</div>
+                    <div class="online-indicator">
+                        <span class="online-dot"></span>
+                        <span id="online-count">1 онлайн</span>
+                    </div>
+                </div>
+                <button class="menu-btn" onclick="chatApp.toggleMenu()">
+                    <i class="fas fa-ellipsis-v"></i>
+                </button>
+            </header>
+            
+            <!-- Контейнер сообщений -->
+            <div class="messages-container" id="messages-container">
+                <!-- Сообщения загружаются здесь -->
+            </div>
+            
+            <!-- Панель ввода -->
+            <div class="input-panel">
+                <div class="input-wrapper">
+                    <textarea 
+                        id="message-input" 
+                        placeholder="Написать сообщение..."
+                        rows="1"
+                        oninput="chatApp.adjustTextarea(this)"
+                        onkeydown="chatApp.handleKeyDown(event)"
+                    ></textarea>
+                    <button class="send-btn" onclick="chatApp.sendMessage()" id="send-btn">
+                        <i class="fas fa-paper-plane"></i>
+                    </button>
+                </div>
+                <div class="media-buttons">
+                    <button class="media-btn" onclick="chatApp.attachPhoto()" title="Фото">
+                        <i class="fas fa-camera"></i>
+                    </button>
+                    <button class="media-btn" onclick="chatApp.attachVoice()" title="Голосовое">
+                        <i class="fas fa-microphone"></i>
+                    </button>
+                    <button class="media-btn" onclick="chatApp.showEmojiPicker()" title="Эмодзи">
+                        <i class="far fa-smile"></i>
+                    </button>
+                </div>
+            </div>
+            
+            <!-- Меню -->
+            <div class="menu-overlay" id="menu-overlay" onclick="chatApp.closeMenu()">
+                <div class="menu-content" onclick="event.stopPropagation()">
+                    <div class="menu-header">
+                        <img id="user-avatar" src="" class="user-avatar" alt="Аватар">
+                        <div class="user-info">
+                            <h3 id="user-name"></h3>
+                            <p id="user-username"></p>
+                        </div>
+                    </div>
+                    <div class="menu-items">
+                        <div class="menu-item" onclick="chatApp.showProfile()">
+                            <span><i class="fas fa-user"></i></span>
+                            <span>Мой профиль</span>
+                        </div>
+                        <div class="menu-item" onclick="chatApp.showParticipants()">
+                            <span><i class="fas fa-users"></i></span>
+                            <span>Участники</span>
+                        </div>
+                        <div class="menu-item" onclick="chatApp.showSettings()">
+                            <span><i class="fas fa-cog"></i></span>
+                            <span>Настройки</span>
+                        </div>
+                        <div class="menu-item" onclick="chatApp.clearChat()">
+                            <span><i class="fas fa-trash"></i></span>
+                            <span>Очистить чат</span>
+                        </div>
+                        <div class="menu-item logout" onclick="chatApp.logout()">
+                            <span><i class="fas fa-sign-out-alt"></i></span>
+                            <span>Выйти</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Эмодзи панель -->
+            <div id="emoji-picker" style="display: none; position: absolute; bottom: 80px; right: 20px; background: #2d2d2d; border-radius: 12px; padding: 12px; z-index: 100;"></div>
+            
+            <!-- Уведомления -->
+            <div id="notifications"></div>
+        </div>
+    </div>
+    
+    <script src="/static/app.js"></script>
+</body>
+</html>
