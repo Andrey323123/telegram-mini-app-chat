@@ -1,6 +1,11 @@
 import sys
 import os
 from pathlib import Path
+from datetime import datetime, timedelta
+import json
+import shutil
+import asyncio
+from typing import Dict, Set, List
 
 # ============================================
 # FIX FOR RAILWAY - Сначала определяем пути
@@ -44,28 +49,12 @@ class Config:
     MEDIA_RETENTION_DAYS = 30
     ENVIRONMENT = "production" if IS_RAILWAY else "development"
 
-# Добавляем пути в sys.path для импортов
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, str(BASE_DIR))
-
-# Теперь импортируем остальное
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse
-import json
-from datetime import datetime, timedelta
-import shutil
-import asyncio
-from typing import Dict, Set, List
-from sqlalchemy.orm import Session
-from sqlalchemy import func, and_
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
-
 # ============================================
-# БАЗА ДАННЫХ (прямо в файле)
+# SQLAlchemy ИМПОРТЫ (должны быть ДО моделей)
 # ============================================
+
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, ForeignKey, func, and_
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 
 # Создаем движок SQLite
 engine = create_engine(
@@ -85,7 +74,7 @@ def get_db():
         db.close()
 
 # ============================================
-# МОДЕЛИ SQLAlchemy (прямо в файле)
+# МОДЕЛИ SQLAlchemy
 # ============================================
 
 class User(Base):
@@ -139,9 +128,14 @@ class Message(Base):
     chat_room = relationship("ChatRoom", back_populates="messages")
     reply_to = relationship("Message", remote_side=[id], backref="replies")
 
-# Импортируем после определения классов
-from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, ForeignKey
-from sqlalchemy.orm import relationship
+# ============================================
+# FASTAPI ИМПОРТЫ
+# ============================================
+
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, JSONResponse
 
 # ============================================
 # FASTAPI ПРИЛОЖЕНИЕ
@@ -248,7 +242,7 @@ async def startup():
     Base.metadata.create_all(bind=engine)
     
     # Создаем общий чат если его нет
-    db = next(get_db())
+    db = SessionLocal()
     try:
         if db.query(ChatRoom).count() == 0:
             general_chat = ChatRoom(
@@ -264,8 +258,8 @@ async def startup():
     finally:
         db.close()
     
-    # Запускаем задачу очистки старых медиа
-    asyncio.create_task(cleanup_old_media_task())
+    print(f"🚀 Сервер запущен на порту {Config.PORT}")
+    print(f"🌐 Домен: telegram-mini-app-chat-production.up.railway.app")
 
 async def cleanup_old_media_task():
     """Фоновая задача очистки старых медиа"""
@@ -617,11 +611,12 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int, user_id: int):
         await manager.connect(websocket, chat_id, user_id)
         
         # Обновляем last_seen
-        db = next(get_db())
+        db = SessionLocal()
         user = db.query(User).filter(User.id == user_id).first()
         if user:
             user.last_seen = datetime.utcnow()
             db.commit()
+        db.close()
         
         while True:
             data = await websocket.receive_json()
@@ -645,9 +640,6 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int, user_id: int):
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"🚀 Запуск сервера на порту {Config.PORT}")
-    print(f"🌐 Домен: telegram-mini-app-chat-production.up.railway.app")
-    print(f"⚙️  Режим: {Config.ENVIRONMENT}")
     
     if Config.ENVIRONMENT == "development":
         uvicorn.run("main:app", host=Config.HOST, port=Config.PORT, reload=True)
