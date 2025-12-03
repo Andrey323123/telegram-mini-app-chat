@@ -37,7 +37,7 @@ MEDIA_PATH.mkdir(parents=True, exist_ok=True)
 class Config:
     BOT_TOKEN = os.getenv("BOT_TOKEN", "")
     BOT_USERNAME = os.getenv("BOT_USERNAME", "")
-    PORT = int(os.getenv("PORT", 8000))
+    PORT = int(os.getenv("PORT", 8080))
     HOST = os.getenv("HOST", "0.0.0.0")
     
     SQLITE_PATH = SQLITE_PATH
