@@ -216,34 +216,6 @@ def init_db():
         logger.error(f"❌ Ошибка инициализации БД: {e}")
         raise
 
-# ======================= MIDDLEWARE ДЛЯ ЛОГИРОВАНИЯ =======================
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    """Логирование всех запросов"""
-    start_time = time.time()
-    
-    # Получаем реальный IP (через Railway прокси)
-    real_ip = request.headers.get("X-Real-IP", request.client.host)
-    cf_connecting_ip = request.headers.get("CF-Connecting-IP")
-    x_forwarded_for = request.headers.get("X-Forwarded-For")
-    
-    logger.info(f"📍 ВХОДЯЩИЙ ЗАПРОС: {request.method} {request.url.path}")
-    logger.info(f"   Client IP: {real_ip}")
-    logger.info(f"   CF IP: {cf_connecting_ip}")
-    logger.info(f"   X-Forwarded-For: {x_forwarded_for}")
-    
-    try:
-        response = await call_next(request)
-        process_time = time.time() - start_time
-        response.headers["X-Process-Time"] = str(process_time)
-        
-        logger.info(f"✅ ОТВЕТ: {request.method} {request.url.path} - Status: {response.status_code} - Time: {process_time:.3f}s")
-        
-        return response
-    except Exception as e:
-        logger.error(f"❌ ОШИБКА В ЗАПРОСЕ {request.method} {request.url.path}: {e}")
-        raise
-
 # ======================= LIFESPAN =======================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -293,6 +265,34 @@ app = FastAPI(
     redoc_url="/redoc" if IS_RAILWAY else None,
     openapi_url="/openapi.json" if IS_RAILWAY else "/openapi.json"
 )
+
+# ======================= MIDDLEWARE ДЛЯ ЛОГИРОВАНИЯ =======================
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Логирование всех запросов"""
+    start_time = time.time()
+    
+    # Получаем реальный IP (через Railway прокси)
+    real_ip = request.headers.get("X-Real-IP", request.client.host)
+    cf_connecting_ip = request.headers.get("CF-Connecting-IP")
+    x_forwarded_for = request.headers.get("X-Forwarded-For")
+    
+    logger.info(f"📍 ВХОДЯЩИЙ ЗАПРОС: {request.method} {request.url.path}")
+    logger.info(f"   Client IP: {real_ip}")
+    logger.info(f"   CF IP: {cf_connecting_ip}")
+    logger.info(f"   X-Forwarded-For: {x_forwarded_for}")
+    
+    try:
+        response = await call_next(request)
+        process_time = time.time() - start_time
+        response.headers["X-Process-Time"] = str(process_time)
+        
+        logger.info(f"✅ ОТВЕТ: {request.method} {request.url.path} - Status: {response.status_code} - Time: {process_time:.3f}s")
+        
+        return response
+    except Exception as e:
+        logger.error(f"❌ ОШИБКА В ЗАПРОСЕ {request.method} {request.url.path}: {e}")
+        raise
 
 # CORS - разрешаем всё для Railway
 app.add_middleware(
