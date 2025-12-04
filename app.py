@@ -16,7 +16,7 @@ from typing import Dict, Optional
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, PlainTextResponse
 from contextlib import asynccontextmanager
 import asyncio
 
@@ -214,9 +214,15 @@ if MEDIA_DIR.exists():
     logger.info("✅ Медиа подключено: /media")
 
 # ======================= API ЭНДПОЙНТЫ =======================
-@app.get("/")
-async def root():
-    """Главная страница"""
+# ВАЖНО: Этот эндпоинт должен быть ПЕРВЫМ и очень простым
+@app.get("/", response_class=PlainTextResponse)
+async def root_simple():
+    """ПРОСТОЙ корневой эндпоинт для Railway health check"""
+    return "Telegram Chat Mini App is running! ✅"
+
+@app.get("/home", response_class=HTMLResponse)
+async def home():
+    """HTML интерфейс"""
     index_path = BASE_DIR / "client" / "index.html"
     
     if index_path.exists():
@@ -308,7 +314,8 @@ async def root():
             
             <div style="margin-top: 30px;">
                 <a href="/api/health" class="btn">Проверить здоровье</a>
-                <a href="/api/chat/messages" class="btn">Сообщения API</a>
+                <a href="/home" class="btn">Интерфейс</a>
+                <a href="/docs" class="btn">API Документация</a>
             </div>
             
             <p style="margin-top: 30px; font-size: 14px; opacity: 0.8;">
@@ -334,6 +341,11 @@ async def root():
     </body>
     </html>
     """)
+
+@app.get("/ping", response_class=PlainTextResponse)
+async def ping():
+    """Простейший ping для проверки"""
+    return "pong"
 
 @app.get("/api/health")
 async def health_check():
@@ -361,7 +373,16 @@ async def health_check():
             },
             "online_users": sum(len(users) for users in manager.active_connections.values()),
             "environment": "railway" if IS_RAILWAY else "development",
-            "websocket": "active"
+            "websocket": "active",
+            "endpoints": {
+                "root": "/",
+                "ping": "/ping",
+                "home": "/home",
+                "docs": "/docs",
+                "api_health": "/api/health",
+                "api_messages": "/api/chat/messages",
+                "websocket": "/ws/{user_id}"
+            }
         }
     except Exception as e:
         return {
